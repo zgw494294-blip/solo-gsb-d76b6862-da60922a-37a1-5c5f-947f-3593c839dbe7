@@ -5,7 +5,7 @@ from threading import Lock
 from typing import List, Literal, Optional, Union
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictStr, field_validator, model_validator
 
 from . import storage as storage_module
 from .playback import (
@@ -36,10 +36,14 @@ app = FastAPI(
         "播放会话（session）按 scene_id 创建内存态会话，游标推进中可接纳场景"
         "后续修订：已开始字幕保持原分轨，其余按原规则重算。事件推进接口返回"
         "一次推进跨过的全部字幕进入/退出事件，短字幕不会在两次采样之间漏掉。"
-        "播放结束可通过 finish 一次取回最终完整快照并释放会话：结束与推进、"
-        "事件推进、接纳串行生效，结束后该会话 id 的一切请求均返回 404。"
+        "播放中可临时隐藏指定说话人的字幕（仅影响该会话、不持久化）：按 "
+        "session_id 提交 hidden_speakers 切换，以当前游标活动区间发出"
+        " exit/enter 显示变更事件，此后推进与事件推进的活动字幕及事件均排除"
+        "隐藏者。播放结束可通过 finish 一次取回最终完整快照并释放会话：结束与"
+        "推进、事件推进、隐藏切换、接纳串行生效，结束后该会话 id 的一切请求"
+        "均返回 404。"
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -254,6 +258,46 @@ class AdvanceEventsResponse(BaseModel):
     cursor_ms: int
     events: List[SubtitleEventOut]
     active: List[ActiveSubtitleOut]
+
+
+class HiddenSpeakersRequest(BaseModel):
+    """临时隐藏说话人切换请求：无重复非空字符串数组，空数组清除。
+
+    元素使用 StrictStr：数字、布尔、null 等非字符串一律 422，不做隐式
+    转换；全为空白的字符串同样拒绝（与字幕 speaker 的非空口径一致）。
+    允许提交会话中尚未出现的说话人（提前隐藏，出现时即不可见）。
+    """
+
+    hidden_speakers: List[StrictStr] = Field(
+        ..., description="要隐藏的说话人标识数组（按 speaker 精确匹配）"
+    )
+
+    @field_validator("hidden_speakers")
+    @classmethod
+    def _no_blank_or_duplicate(cls, v: List[str]) -> List[str]:
+        for speaker in v:
+            if speaker.strip() == "":
+                raise ValueError("hidden_speakers 不能含空字符串")
+        if len(set(v)) != len(v):
+            raise ValueError("hidden_speakers 不能含重复项")
+        return v
+
+
+class HiddenSpeakersResponse(BaseModel):
+    """隐藏切换结果：当前隐藏集合、游标、源版本、可见活动字幕与显示变更事件。
+
+    切换不推进游标。事件时刻为当前游标：原可见而现隐藏的活动字幕发 exit，
+    原隐藏而现可见的发 enter，先 exit 后 enter，同类按会话字幕顺序；
+    集合无变化（或游标处无受影响的活动字幕）时 events 为空。
+    """
+
+    session_id: str
+    scene_id: str
+    source_revision: int
+    cursor_ms: int
+    hidden_speakers: List[str]
+    active: List[ActiveSubtitleOut]
+    events: List[SubtitleEventOut]
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +618,7 @@ def clip_scene(scene_id: str, req: ClipRequest) -> SceneResponse:
 
 
 # ---------------------------------------------------------------------------
-# 播放会话：创建 / 推进 / 事件推进 / 接纳 / 结束
+# 播放会话：创建 / 推进 / 事件推进 / 隐藏说话人 / 接纳 / 结束
 # ---------------------------------------------------------------------------
 
 
@@ -667,6 +711,40 @@ def advance_session_events(
             },
         )
     return AdvanceEventsResponse(**state)
+
+
+@app.post("/sessions/{session_id}/hidden_speakers", response_model=HiddenSpeakersResponse)
+def set_session_hidden_speakers(
+    session_id: str, req: HiddenSpeakersRequest
+) -> HiddenSpeakersResponse:
+    """临时隐藏（或恢复显示）指定说话人的字幕，仅影响该会话、不持久化。
+
+    按 speaker 精确匹配；hidden_speakers 须为无重复的非空字符串数组，
+    空数组清除隐藏，允许提交尚未在会话中出现的说话人。切换与推进、
+    事件推进、接纳、结束在会话锁内完整串行：
+
+    - 以**当前游标**的 `[start_ms, end_ms)`（左闭右开）活动区间比较
+      新旧可见性：原可见而现隐藏的活动字幕发 `exit`，原隐藏而现可见
+      的发 `enter`；事件沿用事件推进字段（id/speaker/track/time_ms/
+      type），`time_ms` 为当前游标；**先 exit 后 enter**，同类按会话
+      字幕顺序；集合无变化（或游标处没有受影响的活动字幕）则无事件；
+    - 切换不推进游标；返回切换后的隐藏集合、游标、源版本、当前可见
+      活动字幕与本次显示变更事件；
+    - 设置后，推进与事件推进返回的 `active`、`events` 均排除隐藏者，
+      游标照常推进；隐藏默认空，会话接纳新快照后设置仍保留；
+    - 完整快照（创建/接纳/结束响应）、接纳的已开始冻结规则与分轨结果
+      不受影响；设置不持久化（重启即清除）。
+
+    非法集合（非字符串/空白/重复、字段缺失或非数组）返回 422 且
+    会话不变；未知或已结束会话返回 404。
+    """
+    session = _get_session_or_404(session_id)
+    try:
+        state = get_playback().set_hidden_speakers(session, req.hidden_speakers)
+    except SessionFinished:
+        # 已取得引用但轮到生效时会话已被结束：与未知会话同等待遇
+        raise _session_gone_404(session_id)
+    return HiddenSpeakersResponse(**state)
 
 
 @app.post("/sessions/{session_id}/accept", response_model=SessionStateResponse)
