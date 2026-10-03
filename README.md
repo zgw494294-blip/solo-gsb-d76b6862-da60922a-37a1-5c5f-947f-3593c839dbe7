@@ -9,7 +9,7 @@
 - 同一说话人的字幕时间不得重叠（属于输入合法性约束，非法返回 422）。
 - 分轨结果可作为**场景（scene）**按 `scene_id` 保存为版本化修订：新场景以 `expected_revision: 0` 创建（成功后版本 1），后续修订须带当前版本；版本不符返回 409。数据落在本地 SQLite，容器重启后仍可读取。
 - 已保存场景的指定时段可**另存为片段（clip）**：`POST /scenes/{id}/clip` 把 `[from_ms, to_ms)` 内相交字幕裁出并减去 `from_ms`，时间轴从 0 毫秒起，源分轨写入各条 `locked_track` 以保持原画面轨道，片段保存为 revision 1 的独立新场景；裁剪数据全部取自与 `expected_revision` 一致的**同一份完整源快照**——读取快照时先核对版本（不符立即 409，绝不拿错配版本裁剪），提交前在同一事务内再核对一次（读取匹配后源被修订同样 409），目标已占用返回 409、源不存在返回 404、窗口无相交字幕返回 422；失败不创建目标、不改源场景或播放会话。
-- 已保存场景可创建**播放会话（session）**：单进程内存态会话复制场景完整快照，游标从 0 毫秒开始推进（只能不减）；播放中可接纳场景的后续修订——已开始（`start_ms` ≤ 游标）的字幕保持原分轨，其余字幕按原最少换轨与并列规则重算。会话不跨重启保留。接纳是完整操作：场景读取、已开始字幕校验、分轨重算与会话替换在会话锁内串行生效，迟到的接纳请求读到的是轮到它生效时的场景快照，不会把会话回写到旧版本。除原 `/advance` 外，另有 `/events` 事件推进：一次推进返回跨过的**全部**字幕进入/退出事件，短字幕即使在两次采样之间开始又结束也不会漏掉。播放结束以 `POST /sessions/{id}/finish` **一次完整操作取回最终快照并释放会话**：成功响应沿用创建会话的全部字段，快照取自轮到结束时的会话（不读取尚未接纳的场景修订），未知会话返回 404；结束与同会话的推进、事件推进、接纳串行生效，并发结束最多一次成功，结束后针对该 id 的一切请求（含已取得会话引用但尚未生效的请求）均返回 404；不改动源场景、其他会话或此前返回的快照，不保存结束记录、不跨重启恢复。
+- 已保存场景可创建**播放会话（session）**：单进程内存态会话复制场景完整快照，游标从 0 毫秒开始推进（只能不减）；播放中可接纳场景的后续修订——已开始（`start_ms` ≤ 游标）的字幕保持原分轨，其余字幕按原最少换轨与并列规则重算。会话不跨重启保留。接纳是完整操作：场景读取、已开始字幕校验、分轨重算与会话替换在会话锁内串行生效，迟到的接纳请求读到的是轮到它生效时的场景快照，不会把会话回写到旧版本。除原 `/advance` 外，另有 `/events` 事件推进：一次推进返回跨过的**全部**字幕进入/退出事件，短字幕即使在两次采样之间开始又结束也不会漏掉。播放时还可通过 `/hidden_speakers` **临时隐藏指定说话人的字幕（仅影响该会话、不持久化）**：按 `speaker` 精确匹配，提交无重复非空字符串数组（空数组清除，允许尚未出现者）；切换时以当前游标的左闭右开活动区间判定，原可见而现隐藏者发 `exit`、原隐藏而现可见者发 `enter`（时刻为当前游标，先 `exit` 后 `enter`，同类按会话字幕顺序，无变化则无事件）；设置后推进与事件推进的活动字幕、事件均排除隐藏者而游标照常推进，隐藏默认空、接纳后保留，完整快照与分轨不受影响。播放结束以 `POST /sessions/{id}/finish` **一次完整操作取回最终快照并释放会话**：成功响应沿用创建会话的全部字段，快照取自轮到结束时的会话（不读取尚未接纳的场景修订），未知会话返回 404；结束与同会话的推进、事件推进、隐藏切换、接纳串行生效，并发结束最多一次成功，结束后针对该 id 的一切请求（含已取得会话引用但尚未生效的请求）均返回 404；不改动源场景、其他会话或此前返回的快照，不保存结束记录、不跨重启恢复。
 
 ## 一条命令启动
 
@@ -594,6 +594,13 @@ curl -s -X POST http://localhost:8080/sessions/$CID/events \
   - 使用轮到该请求生效时的会话快照生成事件（接纳后的游标之后推进，事件与轨道来自接纳后的新快照），不读取未被接纳的场景修订；事件生成、游标更新与活动字幕计算在会话锁内与原推进、接纳**完整串行**。
   - 事件只随本次推进生成、即生即返：**不保存事件历史、不提供重放**；重复推进同一时刻得到空事件。
   - 未知会话（含服务重启后）返回 404；非法时间或游标倒退返回 422；任何失败都不改变会话与场景。
+- `POST /sessions/{session_id}/hidden_speakers`：**临时隐藏说话人**（仅影响该会话，不持久化）。请求体 `{"hidden_speakers": ["Alice", …]}`：
+  - 值为**无重复的非空字符串数组**，按 `speaker` **精确匹配**（区分大小写、不去空白）；**空数组 `[]` 清除全部隐藏**；允许包含会话字幕中**尚未出现**（甚至永不出现）的说话人。非数组/缺失/`null`、元素不是字符串（数字、布尔、浮点等不做隐式转换）、空字符串、重复元素一律 **422**。
+  - 切换**不移动游标**：以当前游标的左闭右开活动区间 `[start_ms, end_ms)` 判断显示变化——**原可见而现隐藏**的活动字幕发 `exit`，**原隐藏而现可见**者发 `enter`。事件沿用 `/events` 的字段（`id`、`speaker`、`track`、`time_ms`、`type`），`time_ms` 取**当前游标**；先全部 `exit` 后全部 `enter`，同类型按**会话字幕顺序**；新旧集合下显示状态相同（含非活动字幕）则无事件，集合无变化时 `events` 为空。
+  - 响应返回 `hidden_speakers`（去重后按提交顺序回显的当前集合）、`cursor_ms`、`source_revision`、切换后可见的 `active` 与显示变更 `events`。
+  - 设置成功后，`/advance` 的 `active` 与 `/events` 的 `events`/`active` **均排除隐藏者**（隐藏期间整条开始又结束的短字幕同样不会出现在事件流里），但**游标照常推进**；隐藏期间已整条播过的字幕在恢复显示时不补发 `enter`（只看当前游标是否活动）。
+  - 隐藏**默认空**；`/accept` 接纳场景修订后隐藏集合**原样保留**；完整快照（创建/接纳/`finish` 的 `subtitles`、`assignments`、`changes`）、已开始字幕的冻结规则与分轨求解**完全不受影响**。设置只存在会话内存中，不写入 SQLite、不跨重启保留。
+  - 切换与同会话的推进、事件推进、接纳、结束在会话锁内**串行生效**；未知或已结束会话返回 **404**，非法集合返回 **422**，失败不改变任何状态。
 - `POST /sessions/{session_id}/accept`：接纳场景当前快照。规则：
   - 轨道数不得变；
   - 会话中 `start_ms` ≤ 游标的字幕（已开始，含已播完），其 `id`、`speaker`、起止时间、`locked_track` 必须不变，并**固定原分轨**；
@@ -1079,6 +1086,105 @@ curl -s -X POST http://localhost:8080/sessions/$SID/advance \
 #  "active":[{"id":"s2",…,"track":2},{"id":"s3",…,"end_ms":4000,…,"track":1}]}
 ```
 
+### 示例 22：临时隐藏说话人——切换、推进、接纳
+
+隐藏设置只作用于**当前会话**：不改动场景快照、分轨与其他会话，也不持久化。下面脚本可直接复制执行：创建场景 → 建会话并推进到 900 → 隐藏 Alice（s1 立即 `exit`）→ 带隐藏事件推进（Alice 的进入/退出全部消失）→ 清除隐藏 → 非法集合 422。
+
+```bash
+# 场景（revision 1）：s1 Alice[0,1000)，s2 Bob[800,3000) 锁轨 2，s3 Alice[1000,2500)
+curl -s -X PUT http://localhost:8080/scenes/scene-hide \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "track_count": 2,
+    "expected_revision": 0,
+    "subtitles": [
+      {"id": "s1", "speaker": "Alice", "start_ms": 0,    "end_ms": 1000},
+      {"id": "s2", "speaker": "Bob",   "start_ms": 800,  "end_ms": 3000, "locked_track": 2},
+      {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2500}
+    ]
+  }' >/dev/null
+
+SID=$(curl -s -X POST http://localhost:8080/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"scene_id": "scene-hide"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["session_id"])')
+
+# 先推进到 900：s1、s2 在屏
+curl -s -X POST http://localhost:8080/sessions/$SID/advance \
+  -H 'Content-Type: application/json' -d '{"time_ms": 900}' >/dev/null
+```
+
+**切换隐藏**：游标不动，当前活动区间里原可见而现隐藏的 s1 发 `exit`（时刻取当前游标 900），响应的 `active` 已排除 Alice：
+
+```bash
+curl -s -X POST http://localhost:8080/sessions/$SID/hidden_speakers \
+  -H 'Content-Type: application/json' \
+  -d '{"hidden_speakers": ["Alice"]}'
+```
+
+```json
+{
+  "session_id": "…",
+  "scene_id": "scene-hide",
+  "source_revision": 1,
+  "cursor_ms": 900,
+  "hidden_speakers": ["Alice"],
+  "events": [
+    {"id": "s1", "speaker": "Alice", "track": 1, "time_ms": 900, "type": "exit"}
+  ],
+  "active": [
+    {"id": "s2", "speaker": "Bob", "start_ms": 800, "end_ms": 3000, "locked_track": 2, "track": 2}
+  ]
+}
+```
+
+**带隐藏推进（/events）**：窗口 (900,3000] 内 s1 的 1000 退出、s3 的 1000 进入与 2500 退出全部属于 Alice 而被排除，只剩 s2 的 3000 退出；游标照常到达 3000：
+
+```bash
+curl -s -X POST http://localhost:8080/sessions/$SID/events \
+  -H 'Content-Type: application/json' -d '{"time_ms": 3000}'
+```
+
+```json
+{
+  "session_id": "…",
+  "scene_id": "scene-hide",
+  "source_revision": 1,
+  "cursor_ms": 3000,
+  "events": [
+    {"id": "s2", "speaker": "Bob", "track": 2, "time_ms": 3000, "type": "exit"}
+  ],
+  "active": []
+}
+```
+
+> 对照：未隐藏时同一推进还会含 `(1000, exit, s1)`、`(1000, enter, s3)`、`(2500, exit, s3)`。隐藏期间整条开始又结束的 s3 不会出现在事件流，也不会在恢复显示时补发。
+
+**空数组清除**：以当前游标 3000 的活动区间判定——Alice 此刻没有活动字幕，因此无 `enter` 事件：
+
+```bash
+curl -s -X POST http://localhost:8080/sessions/$SID/hidden_speakers \
+  -H 'Content-Type: application/json' -d '{"hidden_speakers": []}'
+# {"session_id":"…","source_revision":1,"cursor_ms":3000,"hidden_speakers":[],
+#  "events":[],"active":[]}
+```
+
+同集合重复提交、或加入尚未出现的说话人（如 `"Carol"`）都返回 200 且 `events` 为空；隐藏在 `/accept` 接纳修订后仍然保留，但**创建/接纳/finish 的完整快照与分轨不含任何隐藏过滤**——`subtitles` 与 `assignments` 始终是全量的。
+
+**非法集合 422（会话状态不变）、未知或已结束会话 404**：
+
+```bash
+# 重复说话人 / 空字符串 / 元素非字符串（数字、布尔不隐式转换）/ 非数组 / 缺失
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/hidden_speakers \
+  -H 'Content-Type: application/json' -d '{"hidden_speakers": ["Alice", "Alice"]}'   # 422
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/hidden_speakers \
+  -H 'Content-Type: application/json' -d '{"hidden_speakers": [""]}'                # 422
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/hidden_speakers \
+  -H 'Content-Type: application/json' -d '{"hidden_speakers": [1]}'                 # 422
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/no-such/hidden_speakers \
+  -H 'Content-Type: application/json' -d '{"hidden_speakers": ["Alice"]}'           # 404
+```
+
 健康检查：
 
 ```bash
@@ -1123,15 +1229,16 @@ app/
   main.py      # FastAPI 路由与请求/响应模型（Pydantic 校验），含片段另存 /scenes/{id}/clip 与会话结束 /sessions/{id}/finish
   solver.py    # 纯 Python 求解器与业务校验（无第三方依赖）
   storage.py   # 场景持久化：本地 SQLite（乐观锁版本控制；片段核对源版本与创建目标为同一事务）
-  playback.py  # 播放会话：单进程内存态，推进/事件推进/接纳/结束串行化（接纳含场景读取的完整操作；结束一次取回最终快照并移除注册表）与保轨重算
+  playback.py  # 播放会话：单进程内存态，推进/事件推进/临时隐藏说话人/接纳/结束串行化（接纳含场景读取的完整操作；结束一次取回最终快照并移除注册表）与保轨重算
 tests/
-  conftest.py        # pytest 夹具（场景接口使用临时数据库、会话隔离）
-  test_solver.py     # 求解器单元测试
-  test_api.py        # /assign HTTP 层测试
-  test_scenes.py     # 场景创建/修订/读取/版本冲突/并发测试
-  test_clips.py      # 片段另存：裁剪/保轨/边界、404/409/422、原子性、源与会话不变、独立性、快照错配回归
-  test_playback.py   # 播放会话创建/推进/接纳/冲突/并发测试
-  test_finish.py     # 会话结束：最终快照字段、404、不读未接纳修订、并发结束唯一成功、等待中的推进/事件推进/接纳/重复结束可控交错
+  conftest.py            # pytest 夹具（场景接口使用临时数据库、会话隔离）
+  test_solver.py         # 求解器单元测试
+  test_api.py            # /assign HTTP 层测试
+  test_scenes.py         # 场景创建/修订/读取/版本冲突/并发测试
+  test_clips.py          # 片段另存：裁剪/保轨/边界、404/409/422、原子性、源与会话不变、独立性、快照错配回归
+  test_playback.py       # 播放会话创建/推进/接纳/冲突/并发测试
+  test_hidden_speakers.py # 临时隐藏说话人：切换事件顺序、推进/事件排除、接纳保留、快照不变、404/422、串行化
+  test_finish.py         # 会话结束：最终快照字段、404、不读未接纳修订、并发结束唯一成功、等待中的推进/事件推进/接纳/重复结束可控交错
 Dockerfile
 docker-compose.yml   # 挂载 scenes-data 具名卷到 /data
 requirements.txt / requirements-dev.txt

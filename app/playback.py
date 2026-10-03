@@ -12,6 +12,13 @@
   升序，同刻先退出后进入，同类按会话字幕顺序。0 毫秒已活动的字幕由
   创建响应的快照确定，不产生进入事件。事件只随本次推进生成，不保存
   历史、不提供重放。
+- 临时隐藏说话人（set_hidden_speakers）：按 speaker 精确匹配隐藏字幕，
+  仅作用于本会话的内存状态，默认空、不持久化。设置时游标不变，以当前
+  游标的左闭右开活动区间判断显示差异：原可见而现隐藏的活动字幕发
+  exit，原隐藏而现可见者发 enter；事件沿用原事件字段、时刻取当前游标，
+  先 exit 后 enter，同类按会话字幕顺序，集合无变化则无事件。设置后，
+  推进与事件推进的 active、events 均排除隐藏者，但游标照常推进；接纳
+  不改变隐藏集合。完整快照（state()/finish）与分轨不受影响。
 - 接纳（accept）：把场景当前快照并入会话。轨道数不得变；游标前已开始
   （start_ms <= 游标）的字幕，其 id、speaker、起止时间、locked_track
   必须不变，并固定原分轨；其余字幕可改、可删、可新增，但都必须在游标
@@ -19,15 +26,16 @@
   冲突或无解即失败且会话保持不变；成功则整体替换会话快照与源版本，
   场景本身不受影响。
 - 结束（finish）：一次完整操作取回会话最终完整快照并把会话从注册表
-  移除。结束与同一会话的推进、事件推进、接纳在会话锁内串行生效；
-  快照只取自轮到结束生效时的会话内存状态，不读取场景、因此不会纳入
-  尚未接纳的场景修订。成功响应沿用创建会话的全部字段。结束后该会话
+  移除。结束与同一会话的推进、事件推进、隐藏切换、接纳在会话锁内串行
+  生效；快照只取自轮到结束生效时的会话内存状态，不读取场景、因此不会
+  纳入尚未接纳的场景修订。成功响应沿用创建会话的全部字段。结束后该会话
   ID 的一切请求（含已取得会话引用、在锁上等待的在途请求）均返回 404，
   并发结束最多一次成功。结束不改动源场景、其他会话或此前返回的快照，
   不保存结束记录，也不跨重启恢复。
 
 会话只存在于本进程内存中，不随重启保留。同一会话上的推进、事件推进、
-接纳与结束通过会话级互斥锁串行化：每次调用要么完整生效，要么完全无效。
+隐藏切换、接纳与结束通过会话级互斥锁串行化：每次调用要么完整生效，
+要么完全无效。
 接纳是一个完整操作——场景快照的读取（load_record 回调）、已开始字幕
 校验、分轨重算与会话替换都在会话锁内完成，因此并发下迟到的接纳请求
 读到的一定是轮到它生效时的场景快照，不会把会话回写到进入锁之前读到的
@@ -107,17 +115,25 @@ class PlaybackSession:
     tracks: List[int]
     changes: int
     cursor_ms: int = 0
+    # 临时隐藏的说话人集合：按 speaker 精确匹配，仅影响本会话的
+    # active/events 视图；默认空，接纳后保留，不随会话持久化。
+    hidden_speakers: set = field(default_factory=set)
     # 结束墓碑：finish 在会话锁内置为 True 并移除注册表条目。此后即使
     # 仍持有本对象引用的在途请求，在锁内读到 closed 也一律按 404 失败。
     closed: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def active(self) -> List[Dict[str, Any]]:
-        """游标时刻处于 [start_ms, end_ms) 内的字幕及其轨道（左闭右开）。"""
+        """游标时刻处于 [start_ms, end_ms) 内且未隐藏的字幕及轨道。
+
+        隐藏只过滤播放视图：区间判断仍为左闭右开，分轨与完整快照不变。
+        """
+        hidden = self.hidden_speakers
         return [
             {**sub, "track": track}
             for sub, track in zip(self.subtitles, self.tracks)
-            if sub["start_ms"] <= self.cursor_ms < sub["end_ms"]
+            if sub["speaker"] not in hidden
+            and sub["start_ms"] <= self.cursor_ms < sub["end_ms"]
         ]
 
     def state(self) -> Dict[str, Any]:
@@ -212,7 +228,8 @@ class PlaybackManager:
 
         事件生成、游标更新与活动字幕计算基于同一份会话快照，在会话锁
         内一次完成，与推进、接纳、结束完整串行。倒退抛 CursorRegression，
-        会话保持不变。事件不保存历史、不提供重放。
+        会话保持不变。事件不保存历史、不提供重放。隐藏说话人的字幕不
+        进入 active，也不产生事件；游标仍照常推进。
         """
         with session.lock:
             if session.closed:
@@ -222,9 +239,13 @@ class PlaybackManager:
             old_cursor = session.cursor_ms
             # 每项为 (时刻, 同刻次序, 会话顺序, 事件体)；同刻次序令 exit 在前
             pending: List[Tuple[int, int, int, Dict[str, Any]]] = []
+            hidden = session.hidden_speakers
             for order, (sub, track) in enumerate(
                 zip(session.subtitles, session.tracks)
             ):
+                # 隐藏说话人的字幕既不进入 active，也不产生进入/退出事件
+                if sub["speaker"] in hidden:
+                    continue
                 start_ms = sub["start_ms"]
                 end_ms = sub["end_ms"]
                 base = {
@@ -248,6 +269,73 @@ class PlaybackManager:
                 "scene_id": session.scene_id,
                 "source_revision": session.source_revision,
                 "cursor_ms": session.cursor_ms,
+                "events": events,
+                "active": session.active(),
+            }
+
+    def set_hidden_speakers(
+        self, session: PlaybackSession, hidden_speakers: List[str]
+    ) -> Dict[str, Any]:
+        """替换本会话临时隐藏的说话人集合，并返回当前游标下的显示变更。
+
+        按 speaker 精确匹配；hidden_speakers 由调用方保证为无重复、非空
+        字符串序列（非法集合在 HTTP 层按 422 拒绝，本方法不负责校验），
+        允许包含会话字幕中尚未出现（甚至永不出现）的说话人。游标不移动：
+        以当前游标的左闭右开活动区间 [start_ms, end_ms) 判断新旧可见性——
+
+        - 旧集合可见、新集合隐藏且此刻活动的字幕，产生 exit；
+        - 旧集合隐藏、新集合可见且此刻活动的字幕，产生 enter；
+        - 事件沿用事件推进的字段（id/speaker/track/time_ms/type），
+          time_ms 取当前游标；先全部 exit 后全部 enter，同类按会话字幕
+          顺序；新旧集合下显示状态相同的字幕不产生事件，集合无变化则
+          事件为空。
+
+        设置成功后，推进与事件推进的 active、events 都排除隐藏者，但
+        游标照常推进；完整快照（state()/finish）、分轨与冻结规则不变。
+        设置仅存于会话内存、不持久化，接纳不改变隐藏集合。与推进、事件
+        推进、接纳、结束在会话锁内完整串行；会话已结束抛 SessionFinished。
+        """
+        with session.lock:
+            if session.closed:
+                raise SessionFinished(session.session_id)
+            old_hidden = session.hidden_speakers
+            new_hidden = set(hidden_speakers)
+            cursor = session.cursor_ms
+            exits: List[Tuple[int, Dict[str, Any]]] = []
+            enters: List[Tuple[int, Dict[str, Any]]] = []
+            for order, (sub, track) in enumerate(
+                zip(session.subtitles, session.tracks)
+            ):
+                speaker = sub["speaker"]
+                was_hidden = speaker in old_hidden
+                is_hidden = speaker in new_hidden
+                if was_hidden == is_hidden:
+                    continue
+                # 仅对当前游标左闭右开区间内的活动字幕发显示变更事件
+                if not (sub["start_ms"] <= cursor < sub["end_ms"]):
+                    continue
+                event = {
+                    "id": sub["id"],
+                    "speaker": speaker,
+                    "track": track,
+                    "time_ms": cursor,
+                    "type": "exit" if is_hidden else "enter",
+                }
+                (exits if is_hidden else enters).append((order, event))
+            exits.sort(key=lambda item: item[0])
+            enters.sort(key=lambda item: item[0])
+            # 先 exit 后 enter；同类已按会话字幕顺序
+            events = [item[1] for item in exits] + [
+                item[1] for item in enters
+            ]
+            session.hidden_speakers = new_hidden
+            return {
+                "session_id": session.session_id,
+                "scene_id": session.scene_id,
+                "source_revision": session.source_revision,
+                "cursor_ms": cursor,
+                # 回显本次接纳的集合：去重后保持提交顺序
+                "hidden_speakers": list(hidden_speakers),
                 "events": events,
                 "active": session.active(),
             }
@@ -323,7 +411,9 @@ class PlaybackManager:
             if tracks is None:
                 raise AcceptConflict("固定已开始字幕的原分轨后，新快照无解")
 
-            # 成功：整体替换会话快照与源版本（场景本身不变）
+            # 成功：整体替换会话快照与源版本（场景本身不变）。
+            # hidden_speakers 是仅属于本会话的播放期设置，不在快照内，
+            # 接纳后原样保留；active() 与事件推进自然按新字幕的 speaker 过滤。
             session.subtitles = [dict(s) for s in record.subtitles]
             session.tracks = list(tracks)
             session.changes = changes
@@ -335,8 +425,8 @@ class PlaybackManager:
 
         完整操作的定序为：先在注册表中查到会话，再进入会话锁，在锁内
         置位 closed 墓碑并取出注册表条目，最后对轮到结束生效时的会话
-        状态取快照。与同一会话的推进、事件推进、接纳共用会话锁，因此
-        与它们完整串行：
+        状态取快照。与同一会话的推进、事件推进、隐藏切换、接纳共用会话
+        锁，因此与它们完整串行：
 
         - 快照只取自会话内存状态（session.state()），不读取场景存储，
           不会纳入尚未被接纳的场景修订；

@@ -36,10 +36,13 @@ app = FastAPI(
         "播放会话（session）按 scene_id 创建内存态会话，游标推进中可接纳场景"
         "后续修订：已开始字幕保持原分轨，其余按原规则重算。事件推进接口返回"
         "一次推进跨过的全部字幕进入/退出事件，短字幕不会在两次采样之间漏掉。"
+        "播放时可按 speaker 精确匹配临时隐藏指定说话人的字幕（仅影响该会话、"
+        "不持久化），切换时按当前游标的活动区间返回 exit/enter 显示变更事件，"
+        "隐藏后推进与事件推进的活动字幕及事件均排除隐藏者，游标照常推进。"
         "播放结束可通过 finish 一次取回最终完整快照并释放会话：结束与推进、"
-        "事件推进、接纳串行生效，结束后该会话 id 的一切请求均返回 404。"
+        "事件推进、接纳、隐藏切换串行生效，结束后该会话 id 的一切请求均返回 404。"
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -252,6 +255,46 @@ class AdvanceEventsResponse(BaseModel):
     scene_id: str
     source_revision: int
     cursor_ms: int
+    events: List[SubtitleEventOut]
+    active: List[ActiveSubtitleOut]
+
+
+class HiddenSpeakersRequest(BaseModel):
+    """临时隐藏说话人设置：按 speaker 精确匹配的无重复非空字符串数组。
+
+    空数组清除全部隐藏；元素允许是会话字幕中尚未出现（甚至永不出现）
+    的说话人。非数组、缺失或 null、元素不是字符串（数字/布尔等不做
+    隐式转换）、空字符串、重复元素一律按 422 拒绝。
+    """
+
+    hidden_speakers: List[str] = Field(
+        ..., description="要隐藏的说话人集合：无重复非空字符串数组，空数组清除"
+    )
+
+    @field_validator("hidden_speakers", mode="after")
+    @classmethod
+    def _no_empty_or_duplicate(cls, v: List[str]) -> List[str]:
+        for speaker in v:
+            if speaker == "":
+                raise ValueError("hidden_speakers 不能包含空字符串")
+        if len(set(v)) != len(v):
+            raise ValueError("hidden_speakers 不能包含重复的说话人")
+        return v
+
+
+class HiddenSpeakersResponse(BaseModel):
+    """隐藏切换结果：集合、游标、源版本、切换后可见活动字幕与显示变更事件。
+
+    游标不移动：events 为当前游标活动区间内的显示变化——原可见而现隐藏者
+    发 exit，原隐藏而现可见者发 enter，事件时刻为当前游标；先 exit 后
+    enter，同类按会话字幕顺序；集合无变化时 events 为空。
+    """
+
+    session_id: str
+    scene_id: str
+    source_revision: int
+    cursor_ms: int
+    hidden_speakers: List[str]
     events: List[SubtitleEventOut]
     active: List[ActiveSubtitleOut]
 
@@ -574,7 +617,7 @@ def clip_scene(scene_id: str, req: ClipRequest) -> SceneResponse:
 
 
 # ---------------------------------------------------------------------------
-# 播放会话：创建 / 推进 / 事件推进 / 接纳 / 结束
+# 播放会话：创建 / 推进 / 事件推进 / 临时隐藏说话人 / 接纳 / 结束
 # ---------------------------------------------------------------------------
 
 
@@ -669,6 +712,43 @@ def advance_session_events(
     return AdvanceEventsResponse(**state)
 
 
+@app.post(
+    "/sessions/{session_id}/hidden_speakers",
+    response_model=HiddenSpeakersResponse,
+)
+def set_hidden_speakers(
+    session_id: str, req: HiddenSpeakersRequest
+) -> HiddenSpeakersResponse:
+    """临时隐藏指定说话人的字幕（仅影响该会话，不持久化）。
+
+    请求体为 `{"hidden_speakers": [...]}`：无重复非空字符串数组，按
+    speaker 精确匹配；空数组清除隐藏；允许包含尚未在会话字幕中出现的
+    说话人。游标不移动，以当前游标的左闭右开活动区间
+    `[start_ms, end_ms)` 判断显示变化：
+
+    - 原可见而现隐藏的活动字幕发 `exit`，原隐藏而现可见者发 `enter`；
+    - 事件沿用事件推进的字段（id/speaker/track/time_ms/type），
+      `time_ms` 为当前游标，先 `exit` 后 `enter`，同类按会话字幕顺序；
+      集合无变化则事件为空；
+    - 返回接纳后的隐藏集合、游标、源版本、切换后的可见活动字幕与事件。
+
+    设置后，推进（/advance）与事件推进（/events）的 `active` 与
+    `events` 均排除隐藏者，但游标照常推进；隐藏默认空，接纳场景修订后
+    仍保留；完整快照（创建/接纳/finish）、冻结规则与分轨不受影响。
+    切换与推进、事件推进、接纳、结束在会话锁内串行生效。
+
+    未知或已结束会话返回 404；非法集合（非数组、空字符串、重复、
+    元素非字符串）返回 422；任何失败都不改变会话状态。
+    """
+    session = _get_session_or_404(session_id)
+    try:
+        state = get_playback().set_hidden_speakers(session, req.hidden_speakers)
+    except SessionFinished:
+        # 已取得引用但轮到生效时会话已被结束：与未知会话同等待遇
+        raise _session_gone_404(session_id)
+    return HiddenSpeakersResponse(**state)
+
+
 @app.post("/sessions/{session_id}/accept", response_model=SessionStateResponse)
 def accept_scene_revision(session_id: str) -> SessionStateResponse:
     """接纳场景当前快照，让播放中的会话跟上后续修订。
@@ -711,7 +791,7 @@ def finish_session(session_id: str) -> SessionStateResponse:
     """播放结束：取回最终完整快照并释放会话（一次完整操作）。
 
     在会话锁内把会话标记为已结束并从注册表移除，与同一会话的推进、
-    事件推进、接纳完整串行：
+    事件推进、隐藏切换、接纳完整串行：
 
     - 成功响应沿用创建会话的全部字段（session_id、scene_id、
       source_revision、cursor_ms、track_count、changes、subtitles、
